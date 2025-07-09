@@ -4,10 +4,11 @@ import os
 import time
 from modules.speech_recognizers.speech_recognizer_factory import \
     SpeechRecognizerFactory
-from modules.text_aligner import TextAligner
+from modules.aligners.text_aligner import TextAligner
 from modules.llm_processor import LLMProcessor
 from modules.video_processor import VideoProcessor
-from config import SPEECH_RECOGNIZER_TYPE, WHISPER_MODEL_SIZE
+from modules.word_segmenter import WordSegmenter
+from config import SPEECH_RECOGNIZER_TYPE
 from typing import List, Dict, Optional
 from utils import clear_cache
 
@@ -26,8 +27,9 @@ class ProcessingQueue:
         self.cleanup_worker.start()
 
     def add_task(self, task_id: str, files: List[str], llm_model: str,
-                 prompt: Optional[str], temperature=0.3,
-                 whisper_model_size: Optional[str] = None, enable_alignment=False):
+                 prompt: Optional[str] = None, temperature=0.3,
+                 whisper_model_size: Optional[str] = None,
+                 enable_alignment=False, max_line_length=16):
         """添加任务到队列"""
         with self.lock:
             self.results[task_id] = {
@@ -38,7 +40,8 @@ class ProcessingQueue:
                 "llm_model": llm_model,
                 "timestamp": time.time(),  # 记录任务添加时间
                 "temperature": temperature,
-                "enable_alignment": enable_alignment
+                "enable_alignment": enable_alignment,
+                "max_line_length": max_line_length,
             }
         self.queue.put(task_id)
 
@@ -63,11 +66,11 @@ class ProcessingQueue:
 
                 # 处理每个文件
                 file_results = []
-                recognizer = SpeechRecognizerFactory.get_speech_recognizer_by_type(
-                    SPEECH_RECOGNIZER_TYPE, model_size)
                 llm_model = task_result.get("llm_model")
                 temperature = task_result.get("temperature")
                 llm = LLMProcessor(llm_model, temperature)
+                if task_result['enable_alignment']:
+                    word_segmenter = WordSegmenter()
 
                 for i, file_path in enumerate(files):
                     task_result[
@@ -82,26 +85,32 @@ class ProcessingQueue:
 
                     # 语音识别
                     print(f"开始语音识别: {file_path}")
+                    recognizer = SpeechRecognizerFactory.get_speech_recognizer_by_type(
+                        SPEECH_RECOGNIZER_TYPE, model_size)
                     result = recognizer.transcribe(audio_path)
                     print(
                         f"语音识别完成，segments个数: {len(result['segments'])}")
                     del recognizer
                     clear_cache()
-                    
+
                     if task_result['enable_alignment']:
                         # 文本对齐
                         print("开始文本对齐...")
                         language = result['language']
-                        aligner = TextAligner(language)
+                        aligner = TextAligner(language, word_segmenter,
+                                              task_result.get("max_line_length",
+                                                              16))
                         result = aligner.align(result["segments"], audio_path)
                         result["language"] = language
-                        print("完成文本对齐")
+                        print("文本对齐完成")
                         del aligner
                         clear_cache()
 
                     # 调用大模型进行分段
                     print("调用大模型进行分段...")
-                    llm_inputs = [{key: segment.get(key) for key in ["start", "end", "text"]} for segment in result["segments"]]
+                    llm_inputs = [{key: segment.get(key) for key in
+                                   ["start", "end", "text"]} for segment in
+                                  result["segments"]]
                     segments = llm.segment_video(llm_inputs, prompt)
                     print(f"大模型分段完成，段数: {len(segments)}")
 
